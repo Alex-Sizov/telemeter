@@ -7,6 +7,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -85,6 +86,7 @@ func defaultOpts() *Options {
 		MemcachedExpire:    24 * 60 * 60,
 		MemcachedInterval:  10,
 		TenantID:           "FB870BF3-9F3A-44FF-9BF7-D7A047A52F43",
+		TLSMinVersion:      "TLS1.0",
 	}
 }
 
@@ -116,6 +118,8 @@ func main() {
 
 	cmd.Flags().StringVar(&opt.TLSKeyPath, "tls-key", opt.TLSKeyPath, "Path to a private key to serve TLS for external traffic.")
 	cmd.Flags().StringVar(&opt.TLSCertificatePath, "tls-crt", opt.TLSCertificatePath, "Path to a certificate to serve TLS for external traffic.")
+	cmd.Flags().StringVar(&opt.TLSMinVersion, "tls-min-version", opt.TLSMinVersion, "Minimal TLS version to use for HTTPS server.")
+	cmd.Flags().StringSliceVar(&opt.TLSCipherSuites, "tls-cipher-suites", opt.TLSCipherSuites, "Restrict cipher suites to those listed.")
 
 	cmd.Flags().StringVar(&opt.InternalTLSKeyPath, "internal-tls-key", opt.InternalTLSKeyPath, "Path to a private key to serve TLS for internal traffic.")
 	cmd.Flags().StringVar(&opt.InternalTLSCertificatePath, "internal-tls-crt", opt.InternalTLSCertificatePath, "Path to a certificate to serve TLS for internal traffic.")
@@ -178,6 +182,8 @@ func main() {
 type Options struct {
 	TLSKeyPath         string
 	TLSCertificatePath string
+	TLSMinVersion      string
+	TLSCipherSuites    []string
 
 	InternalTLSKeyPath         string
 	InternalTLSCertificatePath string
@@ -339,6 +345,35 @@ func (o *Options) Run(ctx context.Context, externalListener, internalListener ne
 		return fmt.Errorf("both --internal-tls-key and --internal-tls-crt must be provided")
 	}
 
+	var tlsVersion uint16
+
+	switch o.TLSMinVersion {
+	case "TLS1.0":
+		tlsVersion = tls.VersionTLS10
+	case "TLS1.1":
+		tlsVersion = tls.VersionTLS11
+	case "TLS1.2":
+		tlsVersion = tls.VersionTLS12
+	case "TLS1.3":
+		tlsVersion = tls.VersionTLS13
+	default:
+		return fmt.Errorf("Invalid TLS version value %s", o.TLSMinVersion)
+	}
+
+	tlsConfig := &tls.Config{
+		MinVersion: tlsVersion,
+	}
+
+	if len(o.TLSCipherSuites) > 0 {
+		cipherSuites, err := parseCipherSuites(o.TLSCipherSuites)
+
+		if err != nil {
+			return err
+		}
+
+		tlsConfig.CipherSuites = cipherSuites
+	}
+
 	var g run.Group
 	{
 		internal := http.NewServeMux()
@@ -361,7 +396,8 @@ func (o *Options) Run(ctx context.Context, externalListener, internalListener ne
 		})
 
 		s := &http.Server{
-			Handler: otelhttp.NewHandler(r, "internal", otelhttp.WithTracerProvider(tp)),
+			Handler:   otelhttp.NewHandler(r, "internal", otelhttp.WithTracerProvider(tp)),
+			TLSConfig: tlsConfig,
 		}
 
 		// Run the internal server.
@@ -555,7 +591,8 @@ func (o *Options) Run(ctx context.Context, externalListener, internalListener ne
 		})
 
 		s := &http.Server{
-			Handler: otelhttp.NewHandler(external, "external", otelhttp.WithTracerProvider(tp)),
+			Handler:   otelhttp.NewHandler(external, "external", otelhttp.WithTracerProvider(tp)),
+			TLSConfig: tlsConfig,
 		}
 
 		// Run the external server.
@@ -625,4 +662,20 @@ func loadPrivateKey(data []byte) (crypto.PrivateKey, error) {
 	}
 
 	return nil, fmt.Errorf("unable to parse private key data: '%s', '%s' and '%s'", err0, err1, err2)
+}
+
+func parseCipherSuites(names []string) ([]uint16, error) {
+	cipherSuitesMap := make(map[string]uint16)
+	for _, suite := range append(tls.CipherSuites(), tls.InsecureCipherSuites()...) {
+		cipherSuitesMap[suite.Name] = suite.ID
+	}
+	cipherSuites := make([]uint16, len(names))
+	for i, name := range names {
+		id, present := cipherSuitesMap[name]
+		if !present {
+			return nil, fmt.Errorf("Unknown cipher suite %s\n", name)
+		}
+		cipherSuites[i] = id
+	}
+	return cipherSuites, nil
 }
